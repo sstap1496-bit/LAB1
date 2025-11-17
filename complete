@@ -1,0 +1,785 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sistema de Inspecciones Dinámicas</title>
+    <!-- Carga de Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Configuración de Fuentes y Estilos -->
+    <style>
+        :root {
+            --primary-color: #4f46e5;
+            --secondary-color: #10b981;
+            --background-color: #f9fafb;
+        }
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--background-color);
+        }
+        .btn-primary {
+            background-color: var(--primary-color);
+            transition: background-color 0.2s;
+        }
+        .btn-primary:hover {
+            background-color: #4338ca;
+        }
+        .header-bg {
+            background-color: var(--primary-color);
+        }
+        .nav-active {
+            color: var(--primary-color);
+            border-bottom: 3px solid var(--primary-color);
+            font-weight: 600;
+        }
+        .card {
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.06);
+        }
+        .form-input {
+            border: 1px solid #d1d5db;
+        }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col">
+
+    <!-- Header y Navegación -->
+    <header class="header-bg text-white shadow-md sticky top-0 z-10">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex justify-between items-center">
+            <h1 class="text-xl font-bold">Sistema de Inspección</h1>
+            <div id="auth-status" class="text-sm">Cargando...</div>
+        </div>
+        <nav class="bg-white text-gray-700 shadow-sm">
+            <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex justify-around">
+                <a href="#" data-view="NuevaInspeccion" class="nav-item py-3 px-4 text-sm hover:text-indigo-600 transition duration-150">Nueva Inspección</a>
+                <a href="#" data-view="PlantillasConfiguracion" class="nav-item py-3 px-4 text-sm hover:text-indigo-600 transition duration-150">Plantillas & Configuración</a>
+                <a href="#" data-view="RegistrosHistoricos" class="nav-item py-3 px-4 text-sm hover:text-indigo-600 transition duration-150">Registros Históricos</a>
+            </div>
+        </nav>
+    </header>
+
+    <!-- Contenedor Principal de la Aplicación -->
+    <main class="flex-grow max-w-7xl mx-auto w-full px-4 sm:px-6 lg:px-8 py-8">
+        <div id="app-container" class="space-y-6">
+            <!-- El contenido de la vista activa se inyectará aquí -->
+        </div>
+    </main>
+
+    <!-- Librerías de Firebase -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, addDoc, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, where, getDocs, writeBatch, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Desactivar logs de Firebase para el entorno de Canvas
+        setLogLevel('error'); 
+        
+        // --- VARIABLES GLOBALES Y CONFIGURACIÓN ---
+        
+        // Variables obligatorias del entorno Canvas
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db;
+        let auth;
+        let userId = null;
+        let userEmail = 'Anónimo'; // Simulación
+        let isAuthReady = false;
+
+        const APP_STATE = {
+            currentView: 'NuevaInspeccion',
+            templates: [], // Plantillas (Tabla A)
+            questions: [], // Preguntas_Plantilla (Tabla B)
+            currentInspection: null, // Inspección activa (Tabla C)
+            inspectionResponses: [], // Respuestas de la inspección activa (Tabla D)
+            historicalInspections: [], // Histórico de todas las inspecciones (Tabla C)
+            editingTemplate: null, // Plantilla que se está configurando
+        };
+
+        const ViewContainer = document.getElementById('app-container');
+        const AuthStatus = document.getElementById('auth-status');
+
+        // --- FIREBASE INICIALIZACIÓN Y AUTENTICACIÓN ---
+
+        const initializeFirebase = async () => {
+            if (!Object.keys(firebaseConfig).length) {
+                console.error("Firebase no inicializado: La configuración es nula o vacía.");
+                AuthStatus.textContent = 'Error de Configuración';
+                return;
+            }
+
+            try {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                // 1. Manejar el estado de autenticación
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        // FIX: Solo inicializamos la carga de datos si hay un usuario válido (UID de Firebase)
+                        userId = user.uid;
+                        userEmail = user.email || 'Usuario Autenticado';
+                        AuthStatus.textContent = `Usuario: ${userEmail.split('@')[0]} (ID: ${userId.substring(0, 8)}...)`;
+
+                        if (!isAuthReady) {
+                            isAuthReady = true;
+                            console.log("Autenticación Firebase lista. UID:", userId);
+                            // Iniciar la carga de datos después de la autenticación
+                            setupRealtimeListeners();
+                            renderApp();
+                        }
+                    } else {
+                        // Estado transitorio o de cierre de sesión. No ejecutar listeners.
+                        userId = null;
+                        userEmail = 'No Autenticado';
+                        AuthStatus.textContent = 'Estado de autenticación pendiente...';
+                    }
+                });
+                
+                // 2. Firmar con Custom Token o de forma Anónima
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                    console.log("Sesión iniciada con Custom Token.");
+                } else {
+                    await signInAnonymously(auth);
+                    console.log("Sesión iniciada anónimamente.");
+                }
+
+            } catch (error) {
+                console.error("Error al inicializar o autenticar Firebase:", error);
+                AuthStatus.textContent = `Error: ${error.message}`;
+            }
+        };
+
+        // --- FUNCIONES DE ACCESO A DATOS (Firestore) ---
+
+        // Rutas de Colecciones
+        const getPublicCollectionRef = (collectionName) => collection(db, `artifacts/${appId}/public/data/${collectionName}`);
+        const getUserCollectionRef = (collectionName) => {
+             if (!userId) throw new Error("userId no está disponible para colecciones privadas.");
+             return collection(db, `artifacts/${appId}/users/${userId}/${collectionName}`);
+        };
+
+        // Escuchadores en tiempo real (onSnapshot)
+        const setupRealtimeListeners = () => {
+            if (!db || !userId) return;
+
+            // 1. Plantillas (Públicas)
+            onSnapshot(getPublicCollectionRef('plantillas'), (snapshot) => {
+                APP_STATE.templates = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                console.log(`[Firestore] ${APP_STATE.templates.length} Plantillas cargadas.`);
+                renderApp();
+            }, (error) => console.error("Error al cargar plantillas:", error));
+
+            // 2. Preguntas de Plantilla (Públicas)
+            onSnapshot(getPublicCollectionRef('preguntas_plantilla'), (snapshot) => {
+                APP_STATE.questions = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                console.log(`[Firestore] ${APP_STATE.questions.length} Preguntas cargadas.`);
+                renderApp();
+            }, (error) => console.error("Error al cargar preguntas:", error));
+
+            // 3. Inspecciones Históricas (Privadas)
+            onSnapshot(query(getUserCollectionRef('inspecciones')), (snapshot) => {
+                APP_STATE.historicalInspections = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                // Ordenar por fecha, el más reciente primero
+                APP_STATE.historicalInspections.sort((a, b) => (b.fechaInspeccion?.toDate() || 0) - (a.fechaInspeccion?.toDate() || 0));
+                console.log(`[Firestore] ${APP_STATE.historicalInspections.length} Inspecciones históricas cargadas.`);
+                renderApp();
+            }, (error) => console.error("Error al cargar inspecciones históricas:", error));
+        };
+        
+        // Función para cargar respuestas de una inspección específica
+        const loadInspectionResponses = (inspectionId) => {
+            if (!db || !userId) return;
+
+            // Limpiar listener anterior si existe
+            if (APP_STATE.responseUnsubscribe) APP_STATE.responseUnsubscribe();
+
+            const q = query(
+                getUserCollectionRef('respuestas'),
+                where('refInspeccion', '==', inspectionId)
+            );
+            
+            // Usar onSnapshot para tiempo real en las respuestas de la inspección activa
+            APP_STATE.responseUnsubscribe = onSnapshot(q, (snapshot) => {
+                APP_STATE.inspectionResponses = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                // Asegurar orden por la propiedad 'orden' de la pregunta
+                APP_STATE.inspectionResponses.sort((a, b) => {
+                    const qA = APP_STATE.questions.find(q => q.id === a.refPregunta);
+                    const qB = APP_STATE.questions.find(q => q.id === b.refPregunta);
+                    return (qA?.orden || 999) - (qB?.orden || 999);
+                });
+                console.log(`[Firestore] ${APP_STATE.inspectionResponses.length} Respuestas cargadas para inspección activa.`);
+                renderApp();
+            }, (error) => console.error("Error al cargar respuestas de inspección:", error));
+        };
+
+        // --- LÓGICA DE INSPECCIONES ---
+
+        /**
+         * Simula la Acción de AppSheet: Crea el encabezado de la inspección (Tabla C)
+         * y genera las filas de respuestas vacías (Tabla D).
+         * @param {object} template - La plantilla seleccionada.
+         */
+        const startInspection = async (template) => {
+            if (!isAuthReady || !userId) return alert('Autenticación no lista. Intente de nuevo.');
+
+            // 1. Crear el encabezado de la Inspección (Tabla C)
+            const newInspectionRef = doc(getUserCollectionRef('inspecciones'));
+            const newInspectionId = newInspectionRef.id;
+            
+            const inspectionData = {
+                id: newInspectionId,
+                refPlantilla: template.id,
+                nombrePlantilla: template.nombrePlantilla,
+                inspector: userEmail,
+                fechaInspeccion: new Date(),
+                estado: 'INICIADA',
+            };
+
+            await setDoc(newInspectionRef, inspectionData);
+            
+            APP_STATE.currentInspection = inspectionData;
+            
+            // 2. Generar las filas de Respuestas Vacías (Tabla D) - La magia de la Acción SELECT
+            const questionsForTemplate = APP_STATE.questions.filter(q => q.refPlantilla === template.id);
+            
+            if (questionsForTemplate.length === 0) {
+                 alert(`La plantilla "${template.nombrePlantilla}" no tiene preguntas asociadas.`);
+                 // Mover a la vista de configuración para que el usuario añada preguntas
+                 navigateTo('PlantillasConfiguracion');
+                 return;
+            }
+
+            const batch = writeBatch(db);
+            
+            questionsForTemplate.forEach(question => {
+                const responseRef = doc(getUserCollectionRef('respuestas'));
+                const responseData = {
+                    id: responseRef.id,
+                    refInspeccion: newInspectionId,
+                    refPregunta: question.id,
+                    textoPregunta: question.textoPregunta,
+                    tipoRespuesta: question.tipoRespuesta,
+                    // Dejar los campos de respuesta vacíos inicialmente
+                    respuestaTexto: '',
+                    respuestaSiNo: false,
+                    fotoEvidencia: '',
+                    comentariosAdicionales: '',
+                    completada: false
+                };
+                batch.set(responseRef, responseData);
+            });
+
+            try {
+                await batch.commit();
+                console.log(`[Firestore] ${questionsForTemplate.length} respuestas vacías generadas.`);
+                // 3. Cargar las respuestas y navegar
+                loadInspectionResponses(newInspectionId);
+                navigateTo('ResponderInspeccion');
+            } catch (error) {
+                console.error("Error al generar respuestas batch:", error);
+                alert("Error al generar las preguntas de la inspección.");
+            }
+        };
+
+        /**
+         * Guarda la respuesta de una pregunta individual.
+         * @param {string} responseId - ID del documento de respuesta.
+         * @param {string} type - Tipo de campo de respuesta ('texto', 'sino', 'foto', 'comentarios').
+         * @param {any} value - El nuevo valor.
+         */
+        const saveResponse = async (responseId, type, value) => {
+            const responseRef = doc(getUserCollectionRef('respuestas'), responseId);
+            
+            let updateData = { [`respuesta${type}`]: value };
+            
+            // Marcar como completada si se guarda una respuesta principal
+            if (type === 'Texto' || type === 'SiNo' || type === 'Evidencia') {
+                updateData.completada = true;
+            } else if (type === 'ComentariosAdicionales') {
+                 // No marcamos como completada solo por añadir un comentario adicional
+            }
+
+            try {
+                await updateDoc(responseRef, updateData);
+                console.log(`Respuesta ${responseId} actualizada: ${type}`);
+            } catch (error) {
+                console.error(`Error al guardar la respuesta ${responseId}:`, error);
+                alert('Error al guardar la respuesta.');
+            }
+        };
+        
+        // Función para finalizar la inspección
+        const finalizeInspection = async () => {
+            if (!APP_STATE.currentInspection) return;
+
+            const totalResponses = APP_STATE.inspectionResponses.length;
+            const completedResponses = APP_STATE.inspectionResponses.filter(r => r.completada).length;
+            
+            if (completedResponses < totalResponses) {
+                const confirm = window.confirm(`Faltan ${totalResponses - completedResponses} preguntas por completar. ¿Desea finalizar la inspección de todas formas?`);
+                if (!confirm) return;
+            }
+            
+            const inspectionRef = doc(getUserCollectionRef('inspecciones'), APP_STATE.currentInspection.id);
+            
+            try {
+                await updateDoc(inspectionRef, { estado: 'FINALIZADA', fechaFinalizacion: new Date() });
+                alert(`Inspección "${APP_STATE.currentInspection.nombrePlantilla}" finalizada con éxito.`);
+                APP_STATE.currentInspection = null;
+                if (APP_STATE.responseUnsubscribe) APP_STATE.responseUnsubscribe();
+                navigateTo('RegistrosHistoricos');
+            } catch (error) {
+                 console.error("Error al finalizar la inspección:", error);
+                alert('Error al finalizar la inspección.');
+            }
+        };
+
+        // --- LÓGICA DE RENDERIZADO DE VISTAS ---
+
+        // Configuración de Vistas
+        const views = {
+            
+            // --- Vista 1: Listado de Plantillas para Iniciar Inspección ---
+            NuevaInspeccion: () => {
+                let html = `
+                    <h2 class="text-2xl font-semibold mb-6 text-gray-800">1. Seleccionar Plantilla para Inspección</h2>
+                    <p class="mb-4 text-gray-600">Haga clic en el botón "Iniciar" junto a la plantilla deseada para comenzar una nueva inspección. Esto generará las preguntas automáticamente.</p>
+                `;
+
+                if (APP_STATE.templates.length === 0) {
+                    html += `<div class="p-4 bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700">No hay plantillas disponibles. Vaya a "Plantillas & Configuración" para crear una.</div>`;
+                    return html;
+                }
+
+                APP_STATE.templates.forEach(template => {
+                    html += `
+                        <div class="card bg-white p-4 rounded-lg flex justify-between items-center mb-3 border border-gray-200 hover:shadow-lg transition duration-200">
+                            <span class="text-lg font-medium text-gray-700">${template.nombrePlantilla}</span>
+                            <button 
+                                onclick="window.startInspectionHandler('${template.id}')"
+                                class="flex items-center btn-primary text-white py-2 px-4 rounded-full text-sm font-semibold hover:bg-indigo-700 transition duration-150">
+                                <svg class="w-5 h-5 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.26a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                                Iniciar
+                            </button>
+                        </div>
+                    `;
+                });
+                return html;
+            },
+            
+            // --- Vista 2: Responder Inspección (Formulario Dinámico) ---
+            ResponderInspeccion: () => {
+                if (!APP_STATE.currentInspection || APP_STATE.inspectionResponses.length === 0) {
+                    return `<div class="p-4 bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700">Error: No hay una inspección activa.</div>`;
+                }
+                
+                let html = `
+                    <h2 class="text-2xl font-semibold mb-2 text-gray-800">Inspección Activa: ${APP_STATE.currentInspection.nombrePlantilla}</h2>
+                    <p class="text-sm text-gray-500 mb-6">Inspector: ${APP_STATE.currentInspection.inspector} | Preguntas: ${APP_STATE.inspectionResponses.length}</p>
+                    <button onclick="window.finalizeInspectionHandler()" class="btn-primary text-white py-2 px-6 rounded-full text-lg mb-6 shadow-md hover:shadow-lg transition duration-150 w-full md:w-auto">
+                         <svg class="w-5 h-5 inline-block mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                        Finalizar Inspección
+                    </button>
+                    <div id="response-list" class="space-y-4">
+                `;
+
+                APP_STATE.inspectionResponses.forEach((response, index) => {
+                    const question = APP_STATE.questions.find(q => q.id === response.refPregunta) || { tipoRespuesta: 'Texto Libre' };
+                    const isCompleted = response.completada ? 'bg-green-50 border-green-500' : 'bg-white border-gray-300';
+                    
+                    html += `
+                        <div class="card p-4 rounded-lg border-l-4 ${isCompleted}">
+                            <h3 class="font-bold text-lg text-gray-800 mb-2">${index + 1}. ${response.textoPregunta}</h3>
+                            <p class="text-sm text-indigo-500 mb-3">Tipo: ${question.tipoRespuesta}</p>
+                            <div class="space-y-3">
+                    `;
+                    
+                    // --- Generación de Campos Dinámicos ---
+                    
+                    // 1. Respuesta Sí/No
+                    if (question.tipoRespuesta === 'Sí/No') {
+                        html += `
+                            <div class="flex space-x-4">
+                                <button onclick="window.saveResponseHandler('${response.id}', 'SiNo', true)"
+                                    class="py-2 px-6 rounded-full text-white font-semibold transition duration-150 ${response.respuestaSiNo === true ? 'bg-green-600' : 'bg-gray-400 hover:bg-green-500'}">
+                                    SÍ
+                                </button>
+                                <button onclick="window.saveResponseHandler('${response.id}', 'SiNo', false)"
+                                    class="py-2 px-6 rounded-full text-white font-semibold transition duration-150 ${response.respuestaSiNo === false && response.completada ? 'bg-red-600' : 'bg-gray-400 hover:bg-red-500'}">
+                                    NO
+                                </button>
+                            </div>
+                        `;
+                    }
+                    
+                    // 2. Respuesta Texto Libre
+                    if (question.tipoRespuesta === 'Texto Libre') {
+                        html += `
+                            <textarea onblur="window.saveResponseHandler('${response.id}', 'Texto', this.value)" 
+                                class="form-input w-full p-2 rounded-md shadow-sm resize-y" rows="3" placeholder="Escriba la respuesta aquí">${response.respuestaTexto || ''}</textarea>
+                        `;
+                    }
+                    
+                    // 3. Respuesta Foto (Placeholder para la foto, ya que no podemos subir archivos sin storage)
+                    if (question.tipoRespuesta === 'Foto Obligatoria') {
+                        html += `
+                            <div class="flex flex-col space-y-2">
+                                <span class="text-sm text-gray-500">Nota: La subida de archivos (imágenes) requiere Firebase Storage. Aquí usaremos un campo de texto como simulacro de URL/ID.</span>
+                                <input type="text" onblur="window.saveResponseHandler('${response.id}', 'Evidencia', this.value)"
+                                    value="${response.fotoEvidencia || ''}"
+                                    class="form-input w-full p-2 rounded-md shadow-sm" placeholder="ID de la Foto/URL">
+                            </div>
+                        `;
+                    }
+
+                    // 4. Comentarios Adicionales (Siempre visibles)
+                    html += `
+                        <div class="pt-2">
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Comentarios Adicionales</label>
+                            <textarea onblur="window.saveResponseHandler('${response.id}', 'ComentariosAdicionales', this.value)" 
+                                class="form-input w-full p-2 rounded-md shadow-sm text-sm" rows="2" placeholder="Notas opcionales">${response.comentariosAdicionales || ''}</textarea>
+                        </div>
+                    `;
+                    
+                    html += `
+                            </div>
+                        </div>
+                    `;
+                });
+
+                html += `</div>`;
+                return html;
+            },
+            
+            // --- Vista 3: Plantillas y Configuración ---
+            PlantillasConfiguracion: () => {
+                const isEditing = !!APP_STATE.editingTemplate;
+                const template = APP_STATE.editingTemplate;
+
+                if (isEditing) {
+                    // --- Sub-Vista: Edición de Preguntas ---
+                    const templateQuestions = APP_STATE.questions.filter(q => q.refPlantilla === template.id);
+                    
+                    let html = `
+                        <h2 class="text-2xl font-semibold mb-4 text-gray-800">Editando Plantilla: ${template.nombrePlantilla}</h2>
+                        <button onclick="window.navigateTo('PlantillasConfiguracion')" class="text-indigo-600 hover:text-indigo-800 mb-6 flex items-center">
+                            <svg class="w-5 h-5 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"></path></svg>
+                            Volver al listado
+                        </button>
+                        
+                        <div class="card bg-white p-6 rounded-lg mb-6">
+                            <h3 class="text-xl font-medium mb-4">Preguntas de la Plantilla (${templateQuestions.length})</h3>
+                            <div id="template-questions-list" class="space-y-3 mb-6">
+                    `;
+                    
+                    templateQuestions.sort((a, b) => (a.orden || 999) - (b.orden || 999)).forEach(q => {
+                        html += `
+                            <div class="p-3 bg-gray-50 rounded-md border flex justify-between items-center">
+                                <span class="font-medium text-gray-700">${q.orden}. ${q.textoPregunta}</span>
+                                <span class="text-sm text-indigo-500">${q.tipoRespuesta}</span>
+                                <button onclick="window.deleteQuestionHandler('${q.id}', '${template.id}')" class="text-red-500 hover:text-red-700 transition duration-150">
+                                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                                </button>
+                            </div>
+                        `;
+                    });
+                    
+                    html += `
+                            </div>
+                            
+                            <h3 class="text-xl font-medium mb-4 mt-6">Añadir Nueva Pregunta</h3>
+                            <form onsubmit="window.addQuestionHandler(event, '${template.id}')" class="space-y-4">
+                                <input type="text" id="new-question-text" required placeholder="Texto de la Pregunta (Ej: ¿Manómetro en zona verde?)" class="form-input w-full p-2 rounded-md shadow-sm">
+                                <select id="new-question-type" required class="form-input w-full p-2 rounded-md shadow-sm">
+                                    <option value="">Seleccione Tipo de Respuesta</option>
+                                    <option value="Sí/No">Sí/No</option>
+                                    <option value="Texto Libre">Texto Libre</option>
+                                    <option value="Foto Obligatoria">Foto Obligatoria</option>
+                                </select>
+                                <input type="number" id="new-question-order" required min="1" placeholder="Orden (Ej: 1, 2, 3)" class="form-input w-full p-2 rounded-md shadow-sm">
+                                <button type="submit" class="btn-primary text-white py-2 px-4 rounded-md font-semibold w-full">Añadir Pregunta</button>
+                            </form>
+                        </div>
+                    `;
+                    return html;
+                }
+                
+                // --- Vista Principal: Listado de Plantillas ---
+                let html = `
+                    <h2 class="text-2xl font-semibold mb-6 text-gray-800">2. Plantillas y Configuración</h2>
+                    <p class="mb-4 text-gray-600">Gestione los patrones de preguntas para las inspecciones.</p>
+                    
+                    <div class="card bg-white p-6 rounded-lg mb-6">
+                        <h3 class="text-xl font-medium mb-4">Crear Nueva Plantilla</h3>
+                        <form onsubmit="window.createTemplateHandler(event)" class="flex space-x-3">
+                            <input type="text" id="new-template-name" required placeholder="Nombre de la Plantilla (Ej: Extintor, Bodega)" class="form-input flex-grow p-2 rounded-md shadow-sm">
+                            <button type="submit" class="btn-primary text-white py-2 px-4 rounded-md font-semibold">Crear</button>
+                        </form>
+                    </div>
+
+                    <h3 class="text-xl font-medium mb-4">Plantillas Existentes (${APP_STATE.templates.length})</h3>
+                    <div class="space-y-3">
+                `;
+
+                if (APP_STATE.templates.length === 0) {
+                    html += `<div class="p-4 bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700">No hay plantillas creadas.</div>`;
+                }
+
+                APP_STATE.templates.forEach(template => {
+                    const questionCount = APP_STATE.questions.filter(q => q.refPlantilla === template.id).length;
+                    html += `
+                        <div class="p-4 bg-white rounded-lg border flex justify-between items-center hover:shadow-lg transition duration-200">
+                            <div>
+                                <span class="text-lg font-medium text-gray-700">${template.nombrePlantilla}</span>
+                                <p class="text-sm text-gray-500">${questionCount} preguntas</p>
+                            </div>
+                            <div class="space-x-2">
+                                <button onclick="window.editTemplateHandler('${template.id}')"
+                                    class="text-indigo-600 hover:text-indigo-800 py-1 px-3 rounded-full border border-indigo-200 transition duration-150 text-sm">
+                                    Configurar
+                                </button>
+                                <button onclick="window.deleteTemplateHandler('${template.id}', '${template.nombrePlantilla}')"
+                                    class="text-red-500 hover:text-red-700 py-1 px-3 rounded-full border border-red-200 transition duration-150 text-sm">
+                                    Eliminar
+                                </button>
+                            </div>
+                        </div>
+                    `;
+                });
+                
+                html += `</div>`;
+                return html;
+            },
+            
+            // --- Vista 4: Registros Históricos ---
+            RegistrosHistoricos: () => {
+                let html = `
+                    <h2 class="text-2xl font-semibold mb-6 text-gray-800">3. Registros Históricos de Inspecciones</h2>
+                    <p class="mb-4 text-gray-600">Vista de todos los registros de inspección realizados por este usuario.</p>
+                `;
+
+                if (APP_STATE.historicalInspections.length === 0) {
+                    html += `<div class="p-4 bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700">Aún no hay inspecciones registradas.</div>`;
+                    return html;
+                }
+                
+                APP_STATE.historicalInspections.forEach(inspection => {
+                    const date = inspection.fechaInspeccion?.toDate().toLocaleString('es-ES') || 'Fecha Desconocida';
+                    const completionDate = inspection.fechaFinalizacion?.toDate().toLocaleString('es-ES') || 'N/A';
+                    const statusClass = inspection.estado === 'FINALIZADA' ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700';
+
+                    html += `
+                        <div class="card bg-white p-4 rounded-lg flex justify-between items-center mb-3 border border-gray-200">
+                            <div>
+                                <span class="text-lg font-medium text-gray-700">${inspection.nombrePlantilla}</span>
+                                <p class="text-sm text-gray-500">Iniciada: ${date}</p>
+                                <p class="text-xs text-gray-500">Finalizada: ${completionDate}</p>
+                            </div>
+                            <div class="flex flex-col items-end space-y-2">
+                                <span class="py-1 px-3 rounded-full text-xs font-semibold ${statusClass}">${inspection.estado}</span>
+                                <button onclick="window.viewInspectionDetailsHandler('${inspection.id}')"
+                                    class="text-indigo-600 hover:text-indigo-800 text-sm transition duration-150">
+                                    Ver Respuestas
+                                </button>
+                            </div>
+                        </div>
+                    `;
+                });
+                return html;
+            },
+            
+            // --- Vista 5: Detalle de Inspección Histórica ---
+            VerDetalleHistorico: () => {
+                 // Esta vista requiere un manejo similar al de ResponderInspeccion, pero con datos cargados bajo demanda.
+                 return `<div class="p-4 bg-gray-100">Vista de Detalle en Construcción. Implementación pendiente de la lógica de carga de respuestas históricas.</div>`;
+            }
+        };
+
+        // --- MANEJO DE VISTAS Y NAVEGACIÓN ---
+
+        const renderApp = () => {
+            if (!isAuthReady) {
+                ViewContainer.innerHTML = `<div class="p-8 text-center text-gray-500">Inicializando aplicación y autenticación...</div>`;
+                return;
+            }
+
+            const activeView = views[APP_STATE.currentView];
+            if (activeView) {
+                ViewContainer.innerHTML = activeView();
+            } else {
+                ViewContainer.innerHTML = `<div class="p-8 text-center text-red-500">Vista no encontrada: ${APP_STATE.currentView}</div>`;
+            }
+            
+            // Actualizar el estado de navegación (clase CSS)
+            document.querySelectorAll('.nav-item').forEach(item => {
+                if (item.getAttribute('data-view') === APP_STATE.currentView) {
+                    item.classList.add('nav-active');
+                } else {
+                    item.classList.remove('nav-active');
+                }
+            });
+        };
+
+        const navigateTo = (viewName) => {
+            // Limpiar estados de edición o inspección al cambiar de vista principal
+            if (viewName !== 'ResponderInspeccion') {
+                APP_STATE.editingTemplate = null;
+                // No limpiar currentInspection si navega fuera, solo si finaliza
+            }
+            if (viewName !== 'ResponderInspeccion' && APP_STATE.responseUnsubscribe) {
+                 APP_STATE.responseUnsubscribe();
+            }
+            
+            APP_STATE.currentView = viewName;
+            renderApp();
+        };
+        
+        // Asignar listeners de navegación
+        document.querySelectorAll('.nav-item').forEach(item => {
+            item.addEventListener('click', (e) => {
+                e.preventDefault();
+                const view = e.target.getAttribute('data-view');
+                if (view) navigateTo(view);
+            });
+        });
+
+        // --- HANDLERS GLOBALES DE EVENTOS ---
+        
+        // Manejador para iniciar una inspección desde la vista de plantillas
+        window.startInspectionHandler = (templateId) => {
+            const template = APP_STATE.templates.find(t => t.id === templateId);
+            if (APP_STATE.currentInspection) {
+                const confirm = window.confirm(`Ya hay una inspección activa (${APP_STATE.currentInspection.nombrePlantilla}). ¿Desea descartarla e iniciar una nueva?`);
+                if (!confirm) return;
+                // Si el usuario confirma, descartamos la activa (no guardamos) y seguimos.
+            }
+            if (template) startInspection(template);
+        };
+
+        // Manejador para guardar una respuesta individual
+        window.saveResponseHandler = (responseId, type, value) => {
+            // Convertir tipo para que coincida con la estructura Firestore
+            let firestoreType = type;
+            if (type === 'SiNo') firestoreType = 'SiNo';
+            if (type === 'Texto Libre') firestoreType = 'Texto';
+            if (type === 'Foto Obligatoria') firestoreType = 'Evidencia';
+            if (type === 'ComentariosAdicionales') firestoreType = 'ComentariosAdicionales';
+
+            saveResponse(responseId, firestoreType, value);
+        };
+        
+        // Manejador para finalizar la inspección
+        window.finalizeInspectionHandler = () => {
+            finalizeInspection();
+        };
+
+        // Manejadores de CRUD de Plantillas
+        window.createTemplateHandler = async (event) => {
+            event.preventDefault();
+            const nameInput = document.getElementById('new-template-name');
+            const templateName = nameInput.value.trim();
+            if (!templateName) return;
+            
+            try {
+                const newTemplate = {
+                    nombrePlantilla: templateName,
+                    fechaCreacion: new Date(),
+                    creadoPor: userEmail,
+                };
+                await addDoc(getPublicCollectionRef('plantillas'), newTemplate);
+                nameInput.value = '';
+                alert(`Plantilla "${templateName}" creada.`);
+            } catch (error) {
+                console.error("Error al crear plantilla:", error);
+                alert('Error al crear la plantilla.');
+            }
+        };
+
+        window.editTemplateHandler = (templateId) => {
+            const template = APP_STATE.templates.find(t => t.id === templateId);
+            if (template) {
+                APP_STATE.editingTemplate = template;
+                navigateTo('PlantillasConfiguracion'); // Renderiza la sub-vista de edición
+            }
+        };
+
+        window.deleteTemplateHandler = async (templateId, templateName) => {
+            const confirmDelete = window.confirm(`¿Está seguro de eliminar la plantilla "${templateName}" y todas sus preguntas asociadas?`);
+            if (!confirmDelete) return;
+
+            try {
+                const batch = writeBatch(db);
+                // 1. Eliminar preguntas asociadas
+                const questionsToDelete = APP_STATE.questions.filter(q => q.refPlantilla === templateId);
+                questionsToDelete.forEach(q => {
+                    batch.delete(doc(getPublicCollectionRef('preguntas_plantilla'), q.id));
+                });
+                // 2. Eliminar la plantilla
+                batch.delete(doc(getPublicCollectionRef('plantillas'), templateId));
+                
+                await batch.commit();
+                alert(`Plantilla "${templateName}" y sus preguntas eliminadas con éxito.`);
+            } catch (error) {
+                console.error("Error al eliminar plantilla y preguntas:", error);
+                alert('Error al eliminar la plantilla y/o sus preguntas.');
+            }
+        };
+        
+        // Manejadores de CRUD de Preguntas
+        window.addQuestionHandler = async (event, templateId) => {
+            event.preventDefault();
+            const text = document.getElementById('new-question-text').value.trim();
+            const type = document.getElementById('new-question-type').value;
+            const order = parseInt(document.getElementById('new-question-order').value);
+            
+            if (!text || !type || isNaN(order)) return alert('Todos los campos de la pregunta son obligatorios.');
+
+            try {
+                const newQuestion = {
+                    refPlantilla: templateId,
+                    textoPregunta: text,
+                    tipoRespuesta: type,
+                    orden: order,
+                };
+                await addDoc(getPublicCollectionRef('preguntas_plantilla'), newQuestion);
+                
+                // Limpiar formulario
+                document.getElementById('new-question-text').value = '';
+                document.getElementById('new-question-type').value = '';
+                document.getElementById('new-question-order').value = '';
+                alert('Pregunta añadida.');
+            } catch (error) {
+                console.error("Error al añadir pregunta:", error);
+                alert('Error al añadir la pregunta.');
+            }
+        };
+
+        window.deleteQuestionHandler = async (questionId, templateId) => {
+            const question = APP_STATE.questions.find(q => q.id === questionId);
+            const confirmDelete = window.confirm(`¿Está seguro de eliminar la pregunta "${question.textoPregunta}"?`);
+            if (!confirmDelete) return;
+            
+            try {
+                await deleteDoc(doc(getPublicCollectionRef('preguntas_plantilla'), questionId));
+                alert('Pregunta eliminada.');
+            } catch (error) {
+                console.error("Error al eliminar pregunta:", error);
+                alert('Error al eliminar la pregunta.');
+            }
+        };
+        
+        window.viewInspectionDetailsHandler = (inspectionId) => {
+             // Lógica para cargar las respuestas históricas y renderizar la vista VerDetalleHistorico
+             alert(`Visualizando detalle de Inspección ID: ${inspectionId}. Esta funcionalidad cargará todas las respuestas (Tabla D) asociadas.`);
+             // Se requeriría una función loadHistoricalResponses(inspectionId) aquí.
+        };
+
+
+        // --- INICIO DE LA APLICACIÓN ---
+        initializeFirebase();
+        // Iniciar en la vista principal
+        window.onload = () => navigateTo('NuevaInspeccion');
+    </script>
+</body>
+</html>
